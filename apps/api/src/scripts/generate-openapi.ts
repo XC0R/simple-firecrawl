@@ -31,10 +31,8 @@ const options = {
 
 async function generateOpenAPI() {
   try {
-    // Generate OpenAPI spec
     const openapiSpecification = swaggerJsdoc(options);
     
-    // Write to file
     writeFileSync(
       resolve(__dirname, '../v1-openapi.json'),
       JSON.stringify(openapiSpecification, null, 2)

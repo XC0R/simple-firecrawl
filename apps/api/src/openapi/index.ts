@@ -27,15 +27,13 @@ const options = {
     }
   },
   apis: [
-    './src/controllers/v1/*.ts'  // Path to the API docs
+    './src/controllers/v1/*.ts'  
   ],
 };
 
 export function setupOpenAPI(app: Application & WithWebsocketMethod) {
-  // Generate OpenAPI spec
   const openapiSpecification = swaggerJsdoc(options);
 
-  // Serve OpenAPI spec as JSON
   app.get('/api-docs/openapi.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.send(openapiSpecification);
