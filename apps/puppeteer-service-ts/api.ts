@@ -1,26 +1,24 @@
-import express, { Request, Response } from "express";
-import bodyParser from "body-parser";
-import dotenv from "dotenv";
+import express from 'express';
+import type { Request, Response } from 'express';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import Hero, { Resource, WebsocketResource } from '@ulixee/hero';
+import Core from '@ulixee/hero-core';
+import { TransportBridge } from '@ulixee/net';
+import { ConnectionToHeroCore } from '@ulixee/hero';
 import { getError } from "./helpers/get_error";
-import { Cluster } from "puppeteer-cluster";
-import vanillaPuppeteer, { PuppeteerNodeLaunchOptions } from "puppeteer";
-import { addExtra } from "puppeteer-extra";
-import Stealth from "puppeteer-extra-plugin-stealth";
-import Recaptcha from "puppeteer-extra-plugin-recaptcha";
-import AdBlocker from "puppeteer-extra-plugin-adblocker";
 
 dotenv.config();
 
 const app = express();
-const port = process.env.PORT || 3003;
+const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3003;
+const HERO_CORE_PORT = process.env.HERO_CORE_PORT ? parseInt(process.env.HERO_CORE_PORT, 10) : 1337;
+const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY) || 2;
+
+let heroCore: Core;
+let connectionToCore: ConnectionToHeroCore;
 
 app.use(bodyParser.json());
-
-const PROXY_SERVER = process.env.PROXY_SERVER || null;
-const PROXY_USERNAME = process.env.PROXY_USERNAME || null;
-const PROXY_PASSWORD = process.env.PROXY_PASSWORD || null;
-const TWOCAPTCHA_TOKEN = process.env.TWOCAPTCHA_TOKEN || null;
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY) || 2;
 
 interface UrlModel {
   url: string;
@@ -29,44 +27,6 @@ interface UrlModel {
   headers?: { [key: string]: string };
   check_selector?: string;
 }
-
-let cluster: Cluster;
-
-const initializeBrowser = async () => {
-  const puppeteer = addExtra(vanillaPuppeteer);
-  puppeteer.use(Stealth());
-  puppeteer.use(AdBlocker());
-
-  if (TWOCAPTCHA_TOKEN) {
-    puppeteer.use(
-      Recaptcha({
-        provider: {
-          id: "2captcha",
-          token: TWOCAPTCHA_TOKEN,
-        },
-        visualFeedback: true,
-      })
-    );
-  }
-
-  let puppeteerOptions: PuppeteerNodeLaunchOptions = {
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-  };
-  if (PROXY_SERVER && PROXY_USERNAME && PROXY_PASSWORD) {
-    puppeteerOptions.args?.push(`--proxy-server=${PROXY_SERVER}`);
-  }
-
-  cluster = await Cluster.launch({
-    concurrency: Cluster.CONCURRENCY_CONTEXT,
-    maxConcurrency: MAX_CONCURRENCY,
-    puppeteerOptions,
-    puppeteer,
-  });
-};
-
-const shutdownBrowser = async () => {
-  cluster.close();
-};
 
 const isValidUrl = (urlString: string): boolean => {
   try {
@@ -77,6 +37,27 @@ const isValidUrl = (urlString: string): boolean => {
   }
 };
 
+async function initializeHeroCore(): Promise<void> {
+  try {
+    const bridge = new TransportBridge();
+    connectionToCore = new ConnectionToHeroCore(bridge.transportToCore);
+    
+    heroCore = new Core({
+      maxConcurrentClientCount: MAX_CONCURRENCY
+    });
+    
+    heroCore.addConnection(bridge.transportToClient);
+    await Core.start();
+    await connectionToCore.connect();
+    
+    console.log('Hero Core started and connected successfully');
+    console.log(`Max concurrent sessions: ${MAX_CONCURRENCY}`);
+  } catch (error) {
+    console.error('Failed to start Hero Core:', error);
+    process.exit(1);
+  }
+}
+
 app.post("/scrape", async (req: Request, res: Response) => {
   const {
     url,
@@ -86,7 +67,7 @@ app.post("/scrape", async (req: Request, res: Response) => {
     check_selector,
   }: UrlModel = req.body;
 
-  console.log(`================= Scrape Request =================`);
+  console.log(`\n================= Scrape Request =================`);
   console.log(`URL: ${url}`);
   console.log(`Wait After Load: ${wait_after_load}`);
   console.log(`Timeout: ${timeout}`);
@@ -102,101 +83,124 @@ app.post("/scrape", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid URL" });
   }
 
-  if (!cluster) {
-    await initializeBrowser();
-  }
-
-  let pageContent;
+  let pageContent: string | null = null;
   let pageStatusCode: number | null = null;
-
-  await cluster.task(
-    async ({ page, data }: { page: any; data: UrlModel }): Promise<void> => {
-      const { url, timeout = 60000, headers, check_selector }: UrlModel = data;
-
-      if (PROXY_USERNAME && PROXY_PASSWORD) {
-        await page.authenticate({
-          username: PROXY_USERNAME,
-          password: PROXY_PASSWORD,
-        });
-      }
-
-      if (headers) {
-        await page.setExtraHTTPHeaders(headers);
-      }
-
-      const loadResponse = await page.goto(url, { waitUntil: "load", timeout });
-
-      if (check_selector) {
-        try {
-          await page.waitForSelector(check_selector, { timeout });
-        } catch (error) {
-          throw new Error("Required selector not found");
-        }
-      }
-
-      pageContent = await page.content();
-      pageStatusCode = loadResponse ? loadResponse.status() : null;
-
-      if (!pageContent) {
-        console.log("Load strategy failed, trying networkidle2");
-        const loadResponse = await page.goto(url, {
-          waitUntil: "networkidle2",
-          timeout,
-        });
-
-        if (check_selector) {
-          try {
-            await page.waitForSelector(check_selector, { timeout });
-          } catch (error) {
-            throw new Error("Required selector not found");
-          }
-        }
-
-        pageContent = await page.content();
-        pageStatusCode = loadResponse ? loadResponse.status() : null;
-      }
-
-      await page.close();
-    }
-  );
+  let heroInstance: Hero | undefined;
+  const startTime = Date.now();
 
   try {
-    await cluster.execute(req.body);
-  } catch (err) {
-    console.error(
-      "Failed to execute following URL with cluster:",
-      url,
-      "error: ",
-      err
-    );
+    heroInstance = new Hero({ 
+      connectionToCore,
+      userAgent: headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0'
+    });
+
+    const tab = await heroInstance.activeTab;
+
+    if (headers) {
+      tab.on('resource', (resource: Resource | WebsocketResource) => {
+        if ('request' in resource && 'headers' in resource.request) {
+          Object.entries(headers).forEach(([key, value]) => {
+            if (typeof value === 'string') {
+              resource.request.headers[key] = value;
+            }
+          });
+        }
+      });
+    }
+
+    // Wait for navigation to complete and get response
+    const resource = await tab.goto(url, {
+      timeoutMs: timeout
+    });
+    
+    pageStatusCode = resource.response.statusCode;
+
+    // Wait for page to be stable first
+    await tab.waitForPaintingStable();
+
+    // Check for required selector if specified
+    if (check_selector) {
+      await tab.waitForElement(tab.querySelector(check_selector), {
+        timeoutMs: timeout,
+      });
+    }
+
+    // Wait additional time if specified
+    if (wait_after_load > 0) {
+      await tab.waitForMillis(wait_after_load);
+    }
+
+    // Get the page content
+    const documentElement = await tab.document.documentElement;
+    pageContent = await documentElement.innerHTML;
+
+  } catch (error) {
+    console.error('Scraping error:', error);
+    return res.status(500).json({
+      error: 'Failed to scrape the page',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  } finally {
+    if (heroInstance) {
+      await heroInstance.close().catch(console.error);
+    }
   }
 
-  const pageError = pageStatusCode !== 200 ? getError(pageStatusCode) : false;
+  const errorMessage = getError(pageStatusCode);
+  const executionTime = ((Date.now() - startTime) / 1000).toFixed(2);
 
-  if (!pageError) {
-    console.log(`✅ Scrape of ${url} successful!`);
+  // Log success/failure based on error message
+  if (!errorMessage) {
+    console.log(`✅ Scrape of ${url} successful! (${executionTime}s)`);
   } else {
-    console.log(
-      `🚨 Scrape of ${url} failed with status code: ${pageStatusCode} ${pageError}`
-    );
+    console.log(`🚨 Scrape of ${url} failed: ${pageStatusCode} - ${errorMessage}`);
   }
 
   res.json({
     content: pageContent,
     pageStatusCode,
-    pageError,
+    pageError: errorMessage,
   });
 });
 
-app.listen(port, () => {
-  initializeBrowser().then(() => {
+app.get('/health', async (_req: Request, res: Response) => {
+  try {
+    if (!heroCore) {
+      return res.status(503).json({ 
+        status: 'error',
+        message: 'Hero Core not initialized'
+      });
+    }
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(503).json({ 
+      status: 'error',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+const shutdown = async () => {
+  console.log('\nShutting down server...');
+  
+  try {
+    await Core.shutdown();
+    console.log('Hero Core shut down successfully');
+  } catch (error) {
+    console.error('Error during shutdown:', error);
+  }
+  process.exit(0);
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+(async () => {
+  await initializeHeroCore();
+  
+  app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
   });
-});
+})().catch(console.error);
 
-process.on("SIGINT", () => {
-  shutdownBrowser().then(() => {
-    console.log("Browser closed");
-    process.exit(0);
-  });
-});
+export default app;
